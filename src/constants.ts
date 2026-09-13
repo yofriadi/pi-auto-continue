@@ -17,6 +17,43 @@ export const DEFAULT_TOKEN_LIMIT_CONTINUE_PROMPT =
 export const DEFAULT_INCOMPLETE_TOOL_CALL_CONTINUE_PROMPT =
   "Your previous response was cut off while emitting a tool call, leaving arguments incomplete. Please re-issue the complete tool call with all required arguments. Do not add conversational preamble, explanations, or apologies—proceed directly with executing the tool call, or provide your final response if finished.";
 
+/**
+ * Multiplier applied to a detected rolling quota window so the retry lands
+ * just past the window boundary instead of exactly on it (default: 1.15).
+ */
+export const DEFAULT_WINDOW_RETRY_MARGIN = 1.15;
+
+/**
+ * Phrases that mean the account is out of credit rather than temporarily
+ * throttled. Only consulted when `rateLimit.fatalFirst` is enabled, since
+ * upstream classifies bare quota/usage-limit text as retryable by default.
+ */
+export const QUOTA_EXHAUSTION_PATTERNS: RegExp[] = [
+  /insufficient.?quota/i,
+  /\bquota_exhausted\b/i,
+  /\bbilling_error\b/i,
+  /out.?of.?budget/i,
+  /no.?remaining.?(?:credits|balance)/i,
+  /available.?balance/i,
+];
+
+/**
+ * Signals that a quota error will clear on its own. When one of these is
+ * present, the error is throttling rather than exhaustion and stays
+ * retryable even when `rateLimit.fatalFirst` is enabled.
+ */
+export const RESET_SIGNAL_PATTERNS: RegExp[] = [
+  /retry.?after/i,
+  /try.?again/i,
+  /reset/i,
+  /wait/i,
+  /\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)\b/i,
+  /per.?(?:minute|hour|day)/i,
+  /within\s+\d+/i,
+  /\b(?:RPM|TPM|RPD|TPD)\b/i,
+  /\/\s*\d+\s*(?:m|min|h|d)\b/i,
+];
+
 export const DEFAULT_CONFIG: AutoContinueConfig = {
   enabled: true,
   baseDelayMs: DEFAULT_BASE_DELAY_MS,
@@ -29,6 +66,8 @@ export const DEFAULT_CONFIG: AutoContinueConfig = {
     maxDelayMs: DEFAULT_RATE_LIMIT_MAX_DELAY_MS,
     maxRetries: DEFAULT_RATE_LIMIT_MAX_RETRIES,
     jitter: true,
+    fatalFirst: false,
+    windowRetryMargin: DEFAULT_WINDOW_RETRY_MARGIN,
     retryPrompt: DEFAULT_RATE_LIMIT_RETRY_PROMPT,
   },
   tokenLimit: {

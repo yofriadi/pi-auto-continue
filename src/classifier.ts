@@ -1,7 +1,10 @@
 import {
   BILLING_HARD_LIMIT_PATTERNS,
   CONTEXT_OVERFLOW_PATTERNS,
+  DEFAULT_WINDOW_RETRY_MARGIN,
+  QUOTA_EXHAUSTION_PATTERNS,
   RATE_LIMIT_PATTERNS,
+  RESET_SIGNAL_PATTERNS,
 } from "./constants.ts";
 import { parseTargetTime } from "./config.ts";
 import type { ClassificationResult } from "./types.ts";
@@ -10,6 +13,14 @@ export interface RetryAfterInfo {
   delayMs: number | null;
   expectedResetTime: number | null;
   hasHeader: boolean;
+  /**
+   * True when the delay was inferred from a rolling quota WINDOW
+   * ("Maximum 8 requests within 1 minutes") rather than an absolute reset
+   * point. The window start is unknown, so the value is a worst-case estimate
+   * of the remaining width, and it is used directly instead of being added on
+   * top of the configured base delay.
+   */
+  isWindowEstimate?: boolean;
 }
 
 /**
@@ -18,7 +29,8 @@ export interface RetryAfterInfo {
 export function extractRetryAfterInfo(
   headers?: Record<string, string>,
   errorMessage?: string,
-  now = Date.now()
+  now = Date.now(),
+  windowRetryMargin = DEFAULT_WINDOW_RETRY_MARGIN
 ): RetryAfterInfo {
   // 1. Check HTTP response headers
   if (headers) {
@@ -158,6 +170,31 @@ export function extractRetryAfterInfo(
         };
       }
     }
+
+    // Rolling quota window: "Maximum 8 requests within 1 minutes",
+    // "5 requests per 30 seconds", "limit of 10 req/1min". Unlike the hints
+    // above this states the window WIDTH, not a reset point, so the start is
+    // unknown. Best case it has just opened; worst case the rejected request
+    // landed at its very end and it closes after the full width, so we assume
+    // the full width and retry just past the boundary.
+    const windowMatch = errorMessage.match(
+      /(?:within|per|every|limit\s+of|max(?:imum)?\s+of)\s*(?:~|approx(?:\.|imately)?|about|around)?\s*(\d+(?:\.\d+)?)\s*(ms|s|sec|secs|seconds?|m|min|mins|minutes?|h|hr|hrs|hours?|d|days?)\b/i
+    );
+    if (windowMatch && windowMatch[1]) {
+      const widthMs = toMillis(
+        parseFloat(windowMatch[1]),
+        (windowMatch[2] || "s").toLowerCase()
+      );
+      if (widthMs !== null && widthMs > 0) {
+        const delayMs = Math.round(widthMs * windowRetryMargin);
+        return {
+          delayMs,
+          expectedResetTime: now + delayMs,
+          hasHeader: false,
+          isWindowEstimate: true,
+        };
+      }
+    }
   }
 
   return {
@@ -168,15 +205,29 @@ export function extractRetryAfterInfo(
 }
 
 /**
+ * Converts a magnitude plus a unit token to milliseconds, or null if unrecognised.
+ */
+function toMillis(num: number, unit: string): number | null {
+  if (isNaN(num) || num <= 0) return null;
+  if (unit === "ms") return Math.round(num);
+  if (unit.startsWith("s")) return Math.round(num * 1000);
+  if (unit.startsWith("m")) return Math.round(num * 60 * 1000);
+  if (unit.startsWith("h")) return Math.round(num * 3600 * 1000);
+  if (unit.startsWith("d")) return Math.round(num * 86400 * 1000);
+  return null;
+}
+
+/**
  * Extracts a retry delay in milliseconds from HTTP response headers or error message text.
  * Returns null if no explicit retry delay is specified.
  */
 export function extractRetryAfterDelay(
   headers?: Record<string, string>,
   errorMessage?: string,
-  now = Date.now()
+  now = Date.now(),
+  windowRetryMargin = DEFAULT_WINDOW_RETRY_MARGIN
 ): number | null {
-  return extractRetryAfterInfo(headers, errorMessage, now).delayMs;
+  return extractRetryAfterInfo(headers, errorMessage, now, windowRetryMargin).delayMs;
 }
 
 export interface ClassifyInput {
@@ -186,6 +237,10 @@ export interface ClassifyInput {
   httpStatus?: number;
   httpHeaders?: Record<string, string>;
   now?: number;
+  /** See RateLimitConfig.fatalFirst. Defaults to false (upstream behavior). */
+  fatalFirst?: boolean;
+  /** See RateLimitConfig.windowRetryMargin. */
+  windowRetryMargin?: number;
 }
 
 /**
@@ -197,7 +252,58 @@ export function classifyInterruption(
 ): ClassificationResult {
   const { stopReason, errorMessage, content, httpStatus, httpHeaders } = input;
   const currentTime = now ?? input.now ?? Date.now();
-  const retryInfo = extractRetryAfterInfo(httpHeaders, errorMessage, currentTime);
+  const retryInfo = extractRetryAfterInfo(
+    httpHeaders,
+    errorMessage,
+    currentTime,
+    input.windowRetryMargin ?? DEFAULT_WINDOW_RETRY_MARGIN
+  );
+
+  // 0. Opt-in (`rateLimit.fatalFirst`): let terminal signals outrank a
+  //    retryable HTTP status code. A quota-exhausted or billing-blocked request
+  //    routinely arrives as HTTP 429, and waiting out the retry budget on an
+  //    account with no credit stalls the run for hours.
+  //
+  //    Off by default so behaviour matches upstream: every quota/usage-limit
+  //    message is retried. When on, a message carrying a self-evident reset
+  //    signal ("try again in 20s", "within 1 minutes", "resets at 14:30") is
+  //    still retried, so only terminal-looking text stops the loop.
+  //
+  //    These checks read the status code only for 401/403, which pi reports for
+  //    the same request as the error text, so no cached-response staleness
+  //    applies here beyond what upstream already relies on.
+  const errorTextPre = errorMessage || "";
+  if (input.fatalFirst) {
+    // 401/403 are terminal whatever the body claims: the request was never
+    //    authorized, so no amount of waiting changes the outcome.
+    if (httpStatus === 401 || httpStatus === 403) {
+      return {
+        type: "BILLING_HARD_LIMIT",
+        reason: `HTTP ${httpStatus} authentication or permission failure`,
+        errorMessage: errorTextPre || `HTTP ${httpStatus}`,
+        rawStopReason: stopReason,
+      };
+    }
+    const hasResetSignal = RESET_SIGNAL_PATTERNS.some((p) => p.test(errorTextPre));
+    if (!hasResetSignal && QUOTA_EXHAUSTION_PATTERNS.some((p) => p.test(errorTextPre))) {
+      return {
+        type: "BILLING_HARD_LIMIT",
+        reason: "Quota exhaustion or billing failure without a reset signal",
+        errorMessage: errorTextPre,
+        rawStopReason: stopReason,
+      };
+    }
+    // Context overflow is resolved by Pi's auto-compaction, never by waiting,
+    // so it must not be masked by a retryable status code.
+    if (CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(errorTextPre))) {
+      return {
+        type: "CONTEXT_OVERFLOW",
+        reason: "Context window overflow",
+        errorMessage: errorTextPre,
+        rawStopReason: stopReason,
+      };
+    }
+  }
 
   // 1. Direct HTTP 429 / 503 / 529 Rate Limit or Overload
   if (httpStatus === 429) {
@@ -208,6 +314,7 @@ export function classifyInterruption(
       retryAfterMs: retryInfo.delayMs ?? undefined,
       retryAfterHeaderReceived: retryInfo.hasHeader,
       expectedResetTime: retryInfo.expectedResetTime ?? undefined,
+      isWindowEstimate: retryInfo.isWindowEstimate,
       rawStopReason: stopReason,
     };
   }
@@ -220,6 +327,7 @@ export function classifyInterruption(
       retryAfterMs: retryInfo.delayMs ?? undefined,
       retryAfterHeaderReceived: retryInfo.hasHeader,
       expectedResetTime: retryInfo.expectedResetTime ?? undefined,
+      isWindowEstimate: retryInfo.isWindowEstimate,
       rawStopReason: stopReason,
     };
   }
@@ -257,6 +365,7 @@ export function classifyInterruption(
         retryAfterMs: retryInfo.delayMs ?? undefined,
         retryAfterHeaderReceived: retryInfo.hasHeader,
         expectedResetTime: retryInfo.expectedResetTime ?? undefined,
+        isWindowEstimate: retryInfo.isWindowEstimate,
         rawStopReason: stopReason,
       };
     }

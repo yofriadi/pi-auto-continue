@@ -109,7 +109,8 @@ export class RetryManager {
     now = Date.now(),
     expectedResetTime?: number | null,
     retryAfterHeaderReceived?: boolean,
-    capToMaxDelay = true
+    capToMaxDelay = true,
+    isWindowEstimate = false
   ): RetryCheckResult {
     const rateLimitConfig = config.rateLimit;
 
@@ -179,6 +180,11 @@ export class RetryManager {
     if (!capToMaxDelay) {
       // Explicitly scheduled delay (e.g. /auto-continue at <time>): do not cap or modify
       delayMs = resetDelayMs;
+    } else if (rateLimitAttempt === 1 && resetDelayMs > 0 && isWindowEstimate) {
+      // A rolling-window estimate already measures the time until the window
+      // closes and carries its own margin, so adding baseDelayMs on top of it
+      // would sleep roughly twice as long as the limit requires.
+      delayMs = Math.min(resetDelayMs, maxDelayMs);
     } else if (rateLimitAttempt === 1 && resetDelayMs > 0) {
       // First rate limit retry respects expected quota reset time: baseDelay + expected reset time
       delayMs = baseDelayMs + resetDelayMs;

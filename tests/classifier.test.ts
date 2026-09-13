@@ -236,3 +236,105 @@ describe("classifier", () => {
     });
   });
 });
+
+describe("fork additions", () => {
+  describe("rolling quota window parsing", () => {
+    it("derives a wait from 'Maximum 8 requests within 1 minutes'", () => {
+      const now = 1000000;
+      const err =
+        'Error: 429: {"code":"","message":"You have reached the request limit[z-ai/glm-5.3-free]: Maximum 8 requests within 1 minutes. (request id: 20260913173637238708907fSiZbdHq)","type":"api_error"}';
+      const info = extractRetryAfterInfo(undefined, err, now);
+      assert.equal(info.delayMs, 69000);
+      assert.equal(info.isWindowEstimate, true);
+      assert.equal(info.expectedResetTime, now + 69000);
+    });
+
+    it("honours a configured windowRetryMargin", () => {
+      const info = extractRetryAfterInfo(
+        undefined,
+        "Rate limited: 5 requests per 30 seconds",
+        1000000,
+        2
+      );
+      assert.equal(info.delayMs, 60000);
+      assert.equal(info.isWindowEstimate, true);
+    });
+
+    it("classifies a bare 503 cache-admission rejection as retryable", () => {
+      const result = classifyInterruption({
+        stopReason: "error",
+        httpStatus: 503,
+        errorMessage:
+          'Error: 503: {"message":"cache-only admission rejected a cold, unavailable, or overloaded request","type":"Service Unavailable","param":"","code":"cache_only_cold"}',
+      });
+      assert.equal(result.type, "RATE_LIMIT");
+    });
+
+    it("does not invent a window from unrelated text", () => {
+      const info = extractRetryAfterInfo(undefined, "fetch failed", 1000000);
+      assert.equal(info.delayMs, null);
+      assert.equal(info.isWindowEstimate, undefined);
+    });
+  });
+
+  describe("fatalFirst", () => {
+    const exhausted =
+      '{"error":{"code":"insufficient_quota","message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota"}}';
+
+    it("is off by default: quota-exhausted 429 stays retryable (upstream behavior)", () => {
+      const result = classifyInterruption({
+        stopReason: "error",
+        httpStatus: 429,
+        errorMessage: exhausted,
+      });
+      assert.equal(result.type, "RATE_LIMIT");
+    });
+
+    it("stops a quota-exhausted 429 when enabled", () => {
+      const result = classifyInterruption({
+        stopReason: "error",
+        httpStatus: 429,
+        errorMessage: exhausted,
+        now: Date.now(),
+        fatalFirst: true,
+      });
+      assert.equal(result.type, "BILLING_HARD_LIMIT");
+    });
+
+    it("keeps a window-bounded limit retryable even when enabled", () => {
+      const result = classifyInterruption({
+        stopReason: "error",
+        httpStatus: 429,
+        errorMessage:
+          "You have reached the request limit[z-ai/glm-5.3-free]: Maximum 8 requests within 1 minutes.",
+        now: Date.now(),
+        fatalFirst: true,
+      });
+      assert.equal(result.type, "RATE_LIMIT");
+    });
+
+    it("treats 401/403 as terminal on generic bodies", () => {
+      for (const status of [401, 403]) {
+        const result = classifyInterruption({
+          stopReason: "error",
+          httpStatus: status,
+          errorMessage: "unauthorized",
+          now: Date.now(),
+          fatalFirst: true,
+        });
+        assert.equal(result.type, "BILLING_HARD_LIMIT", `status ${status}`);
+      }
+    });
+
+    it("defers context overflow to auto-compaction ahead of a 429", () => {
+      const result = classifyInterruption({
+        stopReason: "error",
+        httpStatus: 429,
+        errorMessage: "This model's maximum context length is 128000 tokens.",
+        now: Date.now(),
+        fatalFirst: true,
+      });
+      assert.equal(result.type, "CONTEXT_OVERFLOW");
+    });
+  });
+});

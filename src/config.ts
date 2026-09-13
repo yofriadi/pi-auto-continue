@@ -4,6 +4,7 @@ import * as path from "node:path";
 import {
   DEFAULT_CONFIG,
   DEFAULT_MAX_RETRIES,
+  DEFAULT_WINDOW_RETRY_MARGIN,
   DEFAULT_RATE_LIMIT_BASE_DELAY_MS,
   DEFAULT_RATE_LIMIT_MAX_DELAY_MS,
   DEFAULT_RATE_LIMIT_MAX_RETRIES,
@@ -192,6 +193,12 @@ export function loadConfig(customSettingsPath?: string): AutoContinueConfig {
       maxDelayMs: rateLimitMaxDelayMs,
       maxRetries: rateLimitMaxRetries,
       jitter: rateLimitRaw.jitter !== false,
+      fatalFirst: rateLimitRaw.fatalFirst === true,
+      windowRetryMargin:
+        typeof rateLimitRaw.windowRetryMargin === "number" &&
+        rateLimitRaw.windowRetryMargin >= 1
+          ? rateLimitRaw.windowRetryMargin
+          : DEFAULT_WINDOW_RETRY_MARGIN,
       retryPrompt:
         typeof rateLimitRaw.retryPrompt === "string" && rateLimitRaw.retryPrompt.trim().length > 0
           ? rateLimitRaw.retryPrompt.trim()

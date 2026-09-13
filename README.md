@@ -69,6 +69,51 @@ pi -e ./index.ts
 
 ---
 
+## Fork notes
+
+This is a fork of [`jellyhuck/pi-auto-continue`](https://github.com/jellyhuck/pi-auto-continue).
+Two behaviours were added; both are **off by default**, so an unconfigured
+install behaves exactly like upstream.
+
+### 1. Rolling quota windows
+
+Providers such as z-ai state the limit *window* rather than a reset point:
+
+```
+Error: 429: {"message":"You have reached the request limit[z-ai/glm-5.3-free]:
+Maximum 8 requests within 1 minutes."}
+```
+
+Upstream's hint parser needs a preposition (`try again in`, `resets at`), so it
+returns `null` here and falls back to the blind base delay. The fork matches
+`within|per|every|limit of|max(imum) of <N> <unit>` and derives the wait from the
+window width times `windowRetryMargin`, used directly rather than added on top of
+`baseDelayMs` — the estimate already covers the window.
+
+### 2. `rateLimit.fatalFirst`
+
+A quota-exhausted request routinely arrives as HTTP 429. Upstream short-circuits
+on the status code, so `insufficient_quota` is retried for the entire
+`rateLimit.maxRetries` budget — hours on an account with no credit. Enabling
+`fatalFirst` ranks terminal signals above the status code:
+
+- HTTP 401/403 → stop (no body needed)
+- `insufficient_quota`, `billing_error`, `out of budget`, `no remaining credits`… → stop, **unless** the message also states a reset signal, which keeps ordinary throttling retryable
+- context-window overflow → defer to pi's auto-compaction
+
+```json
+{
+  "autoContinue": {
+    "rateLimit": {
+      "fatalFirst": true,
+      "windowRetryMargin": 1.15
+    }
+  }
+}
+```
+
+---
+
 ## Configuration
 
 Configure `pi-auto-continue` in your `~/.pi/agent/settings.json` under the `autoContinue` key:
@@ -87,6 +132,8 @@ Configure `pi-auto-continue` in your `~/.pi/agent/settings.json` under the `auto
       "maxDelayMs": "10m",
       "maxRetries": "5h",
       "jitter": true,
+      "fatalFirst": false,
+      "windowRetryMargin": 1.15,
       "retryPrompt": "The previous request encountered a provider rate/quota limit, which has now resolved. Please resume your task directly from where you left off. Do not apologize or discuss the delay—proceed immediately with the next step."
     },
     "tokenLimit": {
@@ -115,6 +162,8 @@ Configure `pi-auto-continue` in your `~/.pi/agent/settings.json` under the `auto
 | `rateLimit.maxDelayMs`              | `number \| string` | `600000` (`"10m"`) | Maximum delay cap for a single rate limit retry attempt (default: 10 minutes).                                         |
 | `rateLimit.maxRetries`              | `number \| string` | `"5h"`             | Maximum retries or duration deadline for rate limits (default: 5 hours, matching provider quota reset windows).        |
 | `rateLimit.jitter`                  | `boolean`          | `true`             | Adds ±15% random variation to rate limit delays to avoid synchronized thundering herds.                                |
+| `rateLimit.fatalFirst`              | `boolean`          | `false`            | Let terminal signals outrank a retryable HTTP status: 401/403 and quota-exhaustion text stop the loop instead of burning the whole budget; context overflow defers to auto-compaction. Messages stating their own reset window stay retryable. |
+| `rateLimit.windowRetryMargin`       | `number`           | `1.15`             | Multiplier applied to a detected rolling quota window so the retry lands just past the boundary. |
 | `rateLimit.retryPrompt`             | `string`           | _(default prompt)_ | Prompt sent to LLM to resume task execution once rate limit clears.                                                    |
 | `tokenLimit.enabled`                | `boolean`          | `true`             | Whether to automatically continue responses truncated by max output tokens.                                            |
 | `tokenLimit.continuePrompt`         | `string`           | _(default prompt)_ | Prompt sent to LLM to resume text/code generation seamlessly without repeating prior output.                           |

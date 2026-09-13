@@ -12,6 +12,20 @@ export interface RateLimitConfig {
   /** Whether to add random jitter (±15%) to retry delays (default: true) */
   jitter: boolean;
   /**
+   * Let terminal signals outrank a retryable HTTP status code:
+   *   - HTTP 401/403 and quota-exhaustion / billing text stop the retry loop
+   *     instead of being retried for the whole rateLimit budget.
+   *   - Context-window overflow defers to Pi's auto-compaction as it always should.
+   * Messages that state their own reset window ("try again in 20s",
+   * "within 1 minutes") stay retryable. Default false = upstream behavior.
+   */
+  fatalFirst?: boolean;
+  /**
+   * Multiplier applied to a detected rolling quota window so the retry lands
+   * just past the boundary rather than exactly on it (default 1.15).
+   */
+  windowRetryMargin?: number;
+  /**
    * Base delay in ms for rate limits (duration number or string like "1m" or "10s").
    * Defaults to 1 minute (60,000 ms), independent of global baseDelayMs.
    */
@@ -87,6 +101,8 @@ export interface ClassificationResult {
   retryAfterHeaderReceived?: boolean;
   /** Expected epoch timestamp (ms) when quota or tokens reset */
   expectedResetTime?: number;
+  /** True when the delay came from a rolling window width, not a reset point */
+  isWindowEstimate?: boolean;
   rawStopReason?: string;
 }
 

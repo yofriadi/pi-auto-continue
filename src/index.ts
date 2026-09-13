@@ -327,6 +327,8 @@ When your response is interrupted due to output token limits, incomplete tool ca
       content: message.content,
       httpStatus,
       httpHeaders,
+      fatalFirst: config.rateLimit.fatalFirst,
+      windowRetryMargin: config.rateLimit.windowRetryMargin,
     });
 
     if (classification.type === "NONE") {
@@ -349,7 +351,9 @@ When your response is interrupted due to output token limits, incomplete tool ca
         classification.retryAfterMs,
         Date.now(),
         classification.expectedResetTime,
-        classification.retryAfterHeaderReceived
+        classification.retryAfterHeaderReceived,
+        true,
+        classification.isWindowEstimate
       );
 
       await executeRetry(
