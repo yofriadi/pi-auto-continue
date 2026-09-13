@@ -71,7 +71,11 @@ pi -e ./index.ts
 
 ## Fork notes
 
-This is a fork of [`jellyhuck/pi-auto-continue`](https://github.com/jellyhuck/pi-auto-continue).
+Fork of [`jellyhuck/pi-auto-continue`](https://github.com/jellyhuck/pi-auto-continue).
+This repo is the source of truth for `packages/pi-auto-continue` in the
+`pi-extensions` monorepo, which re-syncs from here (`pnpm run update:pi-auto-continue`);
+upstream changes should be merged in here first.
+Changes against upstream:
 Two behaviours were added; both are **off by default**, so an unconfigured
 install behaves exactly like upstream.
 

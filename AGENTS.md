@@ -126,6 +126,14 @@ pi-auto-continue/
 ## 6. Detailed Component Mechanics
 
 ### 1. Interruption Classifier (`src/classifier.ts`)
+
+Precedence: when `rateLimit.fatalFirst` is enabled (fork addition, default false)
+the classifier first rejects terminal signals that would otherwise be masked by a
+retryable HTTP status code — 401/403 by status, then quota-exhaustion/billing text
+that carries **no** reset signal, then context overflow. Otherwise it proceeds
+exactly as upstream. Remaining order: HTTP status 429/503/529 → context overflow →
+billing hard limit → rate limit → incomplete tool call → token limit.
+
 Classifies assistant messages into one of:
 - `RATE_LIMIT`: HTTP 429, 503, 529, Anthropic `overloaded_error`/`rate_limit_error`, Google Gemini `RESOURCE_EXHAUSTED`, OpenAI/Copilot quota limits.
 - `TOKEN_LIMIT`: Truncated outputs where `stopReason === "length"`.
@@ -140,12 +148,13 @@ Extracts delays from:
 - `retry-after-ms` header (explicit milliseconds).
 - `x-ratelimit-reset` / `x-ratelimit-reset-requests` (delta seconds or Unix epoch timestamp).
 - Inline error text patterns (e.g., `try again in 25s`, `retry after 1.5m`, `resets at 2026-09-01T14:30:00Z`).
+- **Rolling quota windows** (fork addition): `within|per|every|limit of|max(imum) of <N> <unit>`, e.g. `Maximum 8 requests within 1 minutes`. The window start is unknown, so the full width is assumed and scaled by `rateLimit.windowRetryMargin` (default 1.15); the result sets `isWindowEstimate`.
 
 ### 3. Retry Manager (`src/retry-manager.ts`)
 - **Consolidated `RetryState`**: Manages a single unified retry state tracking `attempt`, rate limit attempts, elapsed duration, backoff delay, and last interruption type across both rate limit retries and token continuations.
 - **Quota Reset & Backoff Formula**:
   - **Base Delay Selection**: Rate limits default to 1 minute (60,000 ms) via `rateLimit.baseDelayMs` and do not fall back to global `baseDelayMs`. Token/tool continuations use global `baseDelayMs` (default: 5 seconds).
-  - **First Rate Limit Attempt**: Delay respects expected quota reset times when present: $\text{delayMs} = \text{baseDelayMs} + \text{expectedResetTimeMs}$.
+  - **First Rate Limit Attempt**: Delay respects expected quota reset times when present: $\text{delayMs} = \text{baseDelayMs} + \text{expectedResetTimeMs}$. Exception (fork addition): when `isWindowEstimate` is set, the estimate *is* the delay (it already spans the window plus margin), so $\text{delayMs} = \min(\text{resetDelayMs}, \text{maxDelayMs})$ with no base delay added.
   - **Subsequent Attempts & Continuations**: Follows exponential backoff: $\text{rawDelay} = \text{baseDelayMs} \times (\text{backoffMultiplier})^{\text{attempt} - 1}$.
 - **Jitter**: Applies $\pm 15\%$ random variation ($0.85$ to $1.15$) on rate limits during exponential backoff to prevent synchronized retry stampedes.
 - **Clamping**: $\text{delayMs} = \min(\text{maxDelayMs}, \max(\text{baseDelayMs}, \text{calculatedDelay}))$. Rate limits default to 10 minutes (600,000 ms) via `rateLimit.maxDelayMs`. First attempts with explicit quota reset time are not clamped to `maxDelayMs` to respect the full quota reset window.
