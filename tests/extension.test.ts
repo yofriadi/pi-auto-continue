@@ -810,5 +810,3 @@ describe("pi-auto-continue extension", () => {
     await messagePromise;
   });
 });
-
-
